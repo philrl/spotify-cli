@@ -1,0 +1,13 @@
+{
+  "name": "spotify-cli",
+  "private": true,
+  "scripts": {
+    "build": "bun build spotify.ts --compile --outfile dist/spotify-cli"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
