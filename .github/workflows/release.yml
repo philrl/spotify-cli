@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build binary
+        run: |
+          bun build spotify.ts --compile --outfile dist/spotify-cli \
+            --define "CLI_VERSION='${{ steps.version.outputs.VERSION }}'"
+
+      - name: Generate checksum
+        run: |
+          cd dist
+          shasum -a 256 spotify-cli > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/spotify-cli
+            dist/checksums.txt
+          generate_release_notes: true

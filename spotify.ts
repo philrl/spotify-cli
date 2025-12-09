@@ -4,6 +4,11 @@ import { join } from "path";
 import * as fs from "fs";
 import bun from "bun";
 
+
+// Version - injected at build time via --define, defaults to "dev" for local development
+declare const CLI_VERSION: string
+const VERSION = typeof CLI_VERSION !== "undefined" ? CLI_VERSION : "dev"
+
 // Types
 interface Config {
   CLIENT_ID: string;
@@ -666,6 +671,8 @@ function cecho(message: string) {
 function showHelp() {
   console.log("\nUsage:\n");
   console.log("  spotify <command>\n");
+  console.log("Options:\n");
+  console.log("  -v, --version                # Show version number.\n");
   console.log("Commands:\n");
   console.log(
     "  login                        # Authenticate with your Spotify account.",
@@ -1079,6 +1086,12 @@ async function main() {
   const command = args[0];
   const rest = args.slice(1);
 
+
+  // Handle version flag
+  if (command === "--version" || command === "-v") {
+    console.log(`spotify-cli ${VERSION}`)
+    return
+  }
   // Handle login/logout commands separately (doesn't require Spotify app)
   if (command === "login") {
     await login();
