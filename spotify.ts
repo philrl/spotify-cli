@@ -1,13 +1,12 @@
 #!/usr/bin/env bun
 import { homedir } from "os";
 import { join } from "path";
-import * as fs from "fs";
+// import * as fs from "fs";
 import bun from "bun";
 
-
 // Version - injected at build time via --define, defaults to "dev" for local development
-declare const CLI_VERSION: string
-const VERSION = typeof CLI_VERSION !== "undefined" ? CLI_VERSION : "dev"
+declare const CLI_VERSION: string;
+const VERSION = typeof CLI_VERSION !== "undefined" ? CLI_VERSION : "dev";
 
 // Types
 interface Config {
@@ -56,6 +55,446 @@ interface SpotifySearchResponse {
   };
 }
 
+// Player abstraction types
+type RepeatMode = "off" | "track" | "context";
+
+interface TrackInfo {
+  id: string;
+  uri: string;
+  name: string;
+  artist: string;
+  album: string;
+  durationMs: number;
+}
+
+interface PlayerState {
+  isPlaying: boolean;
+  shuffleEnabled: boolean;
+  repeatMode: RepeatMode;
+  volume: number;
+  positionMs: number;
+  track: TrackInfo | null;
+}
+
+// SpotifyPlayer interface - abstraction for playback control
+interface SpotifyPlayer {
+  // State
+  getPlayerState(): Promise<PlayerState>;
+  getCurrentTrack(): Promise<TrackInfo | null>;
+
+  // Playback control
+  play(uri?: string): Promise<void>;
+  pause(): Promise<void>;
+  playPause(): Promise<void>;
+  next(): Promise<void>;
+  previous(): Promise<void>;
+  seek(positionMs: number): Promise<void>;
+
+  // Volume
+  getVolume(): Promise<number>;
+  setVolume(volume: number): Promise<void>;
+
+  // Modes
+  setShuffle(enabled: boolean): Promise<void>;
+  setRepeat(mode: RepeatMode): Promise<void>;
+  getShuffleState(): Promise<boolean>;
+  getRepeatState(): Promise<RepeatMode>;
+}
+
+// AppleScript player implementation - controls local Spotify app on macOS
+class AppleScriptPlayer implements SpotifyPlayer {
+  private async runOsascript(script: string): Promise<string> {
+    try {
+      const result = await bun.$`osascript -e '${script}'`.text();
+      return result.trim();
+    } catch (error) {
+      console.error(error);
+      return "";
+    }
+  }
+
+  async getPlayerState(): Promise<PlayerState> {
+    const script = `tell application "Spotify"
+      set trackId to ""
+      set trackUri to ""
+      set trackName to ""
+      set trackArtist to ""
+      set trackAlbum to ""
+      set trackDuration to 0
+      try
+        set trackUri to spotify url of current track
+        set trackId to text 15 thru -1 of trackUri
+        set trackName to name of current track
+        set trackArtist to artist of current track
+        set trackAlbum to album of current track
+        set trackDuration to duration of current track
+      end try
+      set playerState to player state as string
+      set isShuffling to shuffling
+      set isRepeating to repeating
+      set vol to sound volume
+      set pos to player position
+      return trackId & "|||" & trackUri & "|||" & trackName & "|||" & trackArtist & "|||" & trackAlbum & "|||" & trackDuration & "|||" & playerState & "|||" & isShuffling & "|||" & isRepeating & "|||" & vol & "|||" & pos
+    end tell`;
+
+    const result = await this.runOsascript(script);
+    const parts = result.split("|||");
+
+    const [
+      trackId,
+      trackUri,
+      trackName,
+      trackArtist,
+      trackAlbum,
+      trackDuration,
+      playerState,
+      shuffling,
+      repeating,
+      volume,
+      position,
+    ] = parts;
+
+    const track: TrackInfo | null =
+      trackId && trackUri
+        ? {
+            id: trackId || "",
+            uri: trackUri || "",
+            name: trackName || "",
+            artist: trackArtist || "",
+            album: trackAlbum || "",
+            durationMs: parseInt(trackDuration || "0", 10),
+          }
+        : null;
+
+    return {
+      isPlaying: playerState === "playing",
+      shuffleEnabled: shuffling === "true",
+      repeatMode: repeating === "true" ? "context" : "off",
+      volume: parseInt(volume || "0", 10),
+      positionMs: Math.round(parseFloat(position || "0") * 1000),
+      track,
+    };
+  }
+
+  async getCurrentTrack(): Promise<TrackInfo | null> {
+    const script = `tell application "Spotify"
+      try
+        set trackUri to spotify url of current track
+        set trackId to text 15 thru -1 of trackUri
+        set trackName to name of current track
+        set trackArtist to artist of current track
+        set trackAlbum to album of current track
+        set trackDuration to duration of current track
+        return trackId & "|||" & trackUri & "|||" & trackName & "|||" & trackArtist & "|||" & trackAlbum & "|||" & trackDuration
+      on error
+        return ""
+      end try
+    end tell`;
+
+    const result = await this.runOsascript(script);
+    if (!result) return null;
+
+    const [
+      trackId,
+      trackUri,
+      trackName,
+      trackArtist,
+      trackAlbum,
+      trackDuration,
+    ] = result.split("|||");
+
+    return {
+      id: trackId || "",
+      uri: trackUri || "",
+      name: trackName || "",
+      artist: trackArtist || "",
+      album: trackAlbum || "",
+      durationMs: parseInt(trackDuration || "0", 10),
+    };
+  }
+
+  async play(uri?: string): Promise<void> {
+    if (uri) {
+      await this.runOsascript(
+        `tell application "Spotify" to play track "${uri}"`,
+      );
+    } else {
+      await this.runOsascript('tell application "Spotify" to play');
+    }
+  }
+
+  async pause(): Promise<void> {
+    await this.runOsascript('tell application "Spotify" to pause');
+  }
+
+  async playPause(): Promise<void> {
+    await this.runOsascript('tell application "Spotify" to playpause');
+  }
+
+  async next(): Promise<void> {
+    await this.runOsascript('tell application "Spotify" to next track');
+  }
+
+  async previous(): Promise<void> {
+    await this.runOsascript(`tell application "Spotify"
+      set player position to 0
+      previous track
+    end tell`);
+  }
+
+  async seek(positionMs: number): Promise<void> {
+    const positionSec = positionMs / 1000;
+    await this.runOsascript(
+      `tell application "Spotify" to set player position to ${positionSec}`,
+    );
+  }
+
+  async getVolume(): Promise<number> {
+    const result = await this.runOsascript(
+      'tell application "Spotify" to sound volume as integer',
+    );
+    return parseInt(result || "0", 10);
+  }
+
+  async setVolume(volume: number): Promise<void> {
+    const vol = Math.max(0, Math.min(100, volume));
+    await this.runOsascript(
+      `tell application "Spotify" to set sound volume to ${vol}`,
+    );
+  }
+
+  async setShuffle(enabled: boolean): Promise<void> {
+    await this.runOsascript(
+      `tell application "Spotify" to set shuffling to ${enabled}`,
+    );
+  }
+
+  async setRepeat(mode: RepeatMode): Promise<void> {
+    // AppleScript only supports on/off for repeat, not track vs context
+    const enabled = mode !== "off";
+    await this.runOsascript(
+      `tell application "Spotify" to set repeating to ${enabled}`,
+    );
+  }
+
+  async getShuffleState(): Promise<boolean> {
+    const result = await this.runOsascript(
+      'tell application "Spotify" to shuffling',
+    );
+    return result === "true";
+  }
+
+  async getRepeatState(): Promise<RepeatMode> {
+    const result = await this.runOsascript(
+      'tell application "Spotify" to repeating',
+    );
+    // AppleScript only knows on/off, map to context/off
+    return result === "true" ? "context" : "off";
+  }
+}
+
+// Spotify API response types for player endpoints
+interface SpotifyPlaybackState {
+  is_playing: boolean;
+  shuffle_state: boolean;
+  repeat_state: "off" | "track" | "context";
+  progress_ms: number;
+  device?: { volume_percent: number };
+  item?: {
+    id: string;
+    uri: string;
+    name: string;
+    duration_ms: number;
+    artists: Array<{ name: string }>;
+    album: { name: string };
+  };
+}
+
+interface SpotifyCurrentlyPlaying {
+  is_playing: boolean;
+  progress_ms: number;
+  item?: {
+    id: string;
+    uri: string;
+    name: string;
+    duration_ms: number;
+    artists: Array<{ name: string }>;
+    album: { name: string };
+  };
+}
+
+// API player implementation - controls Spotify via Web API
+class ApiPlayer implements SpotifyPlayer {
+  async getPlayerState(): Promise<PlayerState> {
+    const response =
+      await spotifyApiRequest<SpotifyPlaybackState>("/me/player");
+
+    if (!response.ok || !response.data) {
+      // No active playback or error
+      return {
+        isPlaying: false,
+        shuffleEnabled: false,
+        repeatMode: "off",
+        volume: 0,
+        positionMs: 0,
+        track: null,
+      };
+    }
+
+    const data = response.data;
+    const track: TrackInfo | null = data.item
+      ? {
+          id: data.item.id,
+          uri: data.item.uri,
+          name: data.item.name,
+          artist: data.item.artists.map((a) => a.name).join(", "),
+          album: data.item.album.name,
+          durationMs: data.item.duration_ms,
+        }
+      : null;
+
+    return {
+      isPlaying: data.is_playing,
+      shuffleEnabled: data.shuffle_state,
+      repeatMode: data.repeat_state,
+      volume: data.device?.volume_percent ?? 0,
+      positionMs: data.progress_ms,
+      track,
+    };
+  }
+
+  async getCurrentTrack(): Promise<TrackInfo | null> {
+    const response = await spotifyApiRequest<SpotifyCurrentlyPlaying>(
+      "/me/player/currently-playing",
+    );
+
+    if (!response.ok || !response.data?.item) {
+      return null;
+    }
+
+    const item = response.data.item;
+    return {
+      id: item.id,
+      uri: item.uri,
+      name: item.name,
+      artist: item.artists.map((a) => a.name).join(", "),
+      album: item.album.name,
+      durationMs: item.duration_ms,
+    };
+  }
+
+  async play(uri?: string): Promise<void> {
+    const body = uri
+      ? uri.includes(":track:")
+        ? { uris: [uri] }
+        : { context_uri: uri }
+      : undefined;
+
+    await spotifyApiRequest("/me/player/play", {
+      method: "PUT",
+      body,
+    });
+  }
+
+  async pause(): Promise<void> {
+    await spotifyApiRequest("/me/player/pause", { method: "PUT" });
+  }
+
+  async playPause(): Promise<void> {
+    const state = await this.getPlayerState();
+    if (state.isPlaying) {
+      await this.pause();
+    } else {
+      await this.play();
+    }
+  }
+
+  async next(): Promise<void> {
+    await spotifyApiRequest("/me/player/next", { method: "POST" });
+  }
+
+  async previous(): Promise<void> {
+    await spotifyApiRequest("/me/player/previous", { method: "POST" });
+  }
+
+  async seek(positionMs: number): Promise<void> {
+    await spotifyApiRequest("/me/player/seek", {
+      method: "PUT",
+      params: { position_ms: positionMs.toString() },
+    });
+  }
+
+  async getVolume(): Promise<number> {
+    const state = await this.getPlayerState();
+    return state.volume;
+  }
+
+  async setVolume(volume: number): Promise<void> {
+    const vol = Math.max(0, Math.min(100, volume));
+    await spotifyApiRequest("/me/player/volume", {
+      method: "PUT",
+      params: { volume_percent: vol.toString() },
+    });
+  }
+
+  async setShuffle(enabled: boolean): Promise<void> {
+    await spotifyApiRequest("/me/player/shuffle", {
+      method: "PUT",
+      params: { state: enabled.toString() },
+    });
+  }
+
+  async setRepeat(mode: RepeatMode): Promise<void> {
+    await spotifyApiRequest("/me/player/repeat", {
+      method: "PUT",
+      params: { state: mode },
+    });
+  }
+
+  async getShuffleState(): Promise<boolean> {
+    const state = await this.getPlayerState();
+    return state.shuffleEnabled;
+  }
+
+  async getRepeatState(): Promise<RepeatMode> {
+    const state = await this.getPlayerState();
+    return state.repeatMode;
+  }
+}
+
+// Player factory - selects appropriate implementation based on environment
+type PlayerType = "applescript" | "api" | "auto";
+
+async function createPlayer(
+  preferredType: PlayerType = "auto",
+): Promise<SpotifyPlayer> {
+  // If explicitly requesting API, use it
+  if (preferredType === "api") {
+    return new ApiPlayer();
+  }
+
+  // If explicitly requesting AppleScript, use it (will fail on non-macOS)
+  if (preferredType === "applescript") {
+    return new AppleScriptPlayer();
+  }
+
+  // Auto-detect: prefer AppleScript on macOS if Spotify app is installed
+  if (process.platform === "darwin") {
+    const spotifyAppPath1 = "/Applications/Spotify.app";
+    const spotifyAppPath2 = join(homedir(), "Applications/Spotify.app");
+
+    const app1Exists = await Bun.file(spotifyAppPath1).exists();
+    const app2Exists = await Bun.file(spotifyAppPath2).exists();
+
+    if (app1Exists || app2Exists) {
+      return new AppleScriptPlayer();
+    }
+  }
+
+  // Fall back to API
+  return new ApiPlayer();
+}
+
 // Configuration
 const USER_CONFIG_FILE = join(homedir(), ".shpotify.cfg");
 const USER_CONFIG_DEFAULTS = 'CLIENT_ID=""\nCLIENT_SECRET=""';
@@ -83,16 +522,18 @@ let config: Config = { CLIENT_ID: "", CLIENT_SECRET: "" };
 let spotifyAccessToken: string = "";
 
 // Initialize config file
-function initializeConfig() {
-  if (!fs.existsSync(USER_CONFIG_FILE)) {
-    fs.writeFileSync(USER_CONFIG_FILE, USER_CONFIG_DEFAULTS);
+async function initializeConfig() {
+  const configFile = Bun.file(USER_CONFIG_FILE);
+  if (!configFile.exists()) {
+    await configFile.write(USER_CONFIG_DEFAULTS);
   }
-  loadConfig();
+  await loadConfig();
 }
 
-function loadConfig() {
+async function loadConfig() {
   try {
-    const content = fs.readFileSync(USER_CONFIG_FILE, "utf-8");
+    const configFile = Bun.file(USER_CONFIG_FILE);
+    const content = await configFile.text();
     const lines = content.split("\n");
     for (const line of lines) {
       if (line.startsWith("CLIENT_ID=")) {
@@ -289,13 +730,30 @@ async function spotifyApiRequest<T>(
     return { ok: false, status: response.status, error: errorText };
   }
 
-  // Handle empty responses (204 No Content)
+  // Handle empty responses (204 No Content, or empty body)
   if (response.status === 204) {
     return { ok: true, status: 204 };
   }
 
-  const data = (await response.json()) as T;
-  return { ok: true, status: response.status, data };
+  // Check content-length or try to parse JSON safely
+  const contentLength = response.headers.get("content-length");
+  if (contentLength === "0") {
+    return { ok: true, status: response.status };
+  }
+
+  // Try to parse JSON, handle empty responses gracefully
+  const text = await response.text();
+  if (!text || text.trim() === "") {
+    return { ok: true, status: response.status };
+  }
+
+  try {
+    const data = JSON.parse(text) as T;
+    return { ok: true, status: response.status, data };
+  } catch {
+    // If JSON parsing fails but response was ok, return success without data
+    return { ok: true, status: response.status };
+  }
 }
 
 // Login Flow
@@ -436,7 +894,15 @@ async function logout(): Promise<void> {
   }
 }
 
-// Get current track ID from Spotify app
+// Get current track ID using player interface
+async function getCurrentTrackIdWithPlayer(
+  player: SpotifyPlayer,
+): Promise<string | null> {
+  const track = await player.getCurrentTrack();
+  return track?.id ?? null;
+}
+
+// Legacy function for backward compatibility
 async function getCurrentTrackId(): Promise<string | null> {
   const trackUri = await runOsascript(
     'tell application "Spotify" to spotify url of current track',
@@ -452,6 +918,30 @@ async function getCurrentTrackId(): Promise<string | null> {
 }
 
 // Save current track to user's library
+async function saveCurrentTrackWithPlayer(
+  player: SpotifyPlayer,
+): Promise<void> {
+  const track = await player.getCurrentTrack();
+
+  if (!track) {
+    cecho("No track is currently playing.");
+    return;
+  }
+
+  // Save the track
+  const response = await spotifyApiRequest("/me/tracks", {
+    method: "PUT",
+    body: { ids: [track.id] },
+  });
+
+  if (response.ok) {
+    cecho(`Saved "${track.name}" by ${track.artist} to your library.`);
+  } else {
+    cecho(`Failed to save track: ${response.status} ${response.error}`);
+  }
+}
+
+// Legacy function for backward compatibility
 async function saveCurrentTrack(): Promise<void> {
   // Get current track info for display
   const artist = await showArtist();
@@ -487,7 +977,47 @@ async function getTrackDetails(trackId: string): Promise<TrackDetails | null> {
   return response.ok ? (response.data ?? null) : null;
 }
 
-// Follow the artist of the current track
+// Follow the artist of the current track using player interface
+async function followCurrentArtistWithPlayer(
+  player: SpotifyPlayer,
+): Promise<void> {
+  const track = await player.getCurrentTrack();
+
+  if (!track) {
+    cecho("No track is currently playing.");
+    return;
+  }
+
+  // Get track details to get artist ID
+  const trackDetails = await getTrackDetails(track.id);
+
+  if (!trackDetails || trackDetails.artists.length === 0) {
+    cecho("Could not get artist information for the current track.");
+    return;
+  }
+
+  // Get the first (primary) artist
+  const artist = trackDetails.artists[0];
+
+  if (!artist) {
+    cecho("Could not get artist information for the current track.");
+    return;
+  }
+
+  // Follow the artist
+  const response = await spotifyApiRequest("/me/following", {
+    method: "PUT",
+    params: { type: "artist", ids: artist.id },
+  });
+
+  if (response.ok) {
+    cecho(`Now following ${artist.name}.`);
+  } else {
+    cecho(`Failed to follow artist: ${response.status} ${response.error}`);
+  }
+}
+
+// Legacy function for backward compatibility
 async function followCurrentArtist(): Promise<void> {
   // Get current track ID
   const trackId = await getCurrentTrackId();
@@ -672,7 +1202,10 @@ function showHelp() {
   console.log("\nUsage:\n");
   console.log("  spotify <command>\n");
   console.log("Options:\n");
-  console.log("  -v, --version                # Show version number.\n");
+  console.log("  -v, --version                # Show version number.");
+  console.log(
+    "  --api                        # Force using Spotify Web API instead of local app.\n",
+  );
   console.log("Commands:\n");
   console.log(
     "  login                        # Authenticate with your Spotify account.",
@@ -815,7 +1348,7 @@ async function runOsascript(script: string): Promise<string> {
   }
 }
 
-// Show current track info
+// Show current track info - these legacy functions are kept for backward compatibility
 async function showArtist(): Promise<string> {
   return await runOsascript(
     'tell application "Spotify" to artist of current track as string',
@@ -840,6 +1373,29 @@ function formatTime(seconds: number): string {
   return `${minutes}:${secs.toString().padStart(2, "0")}`;
 }
 
+function formatTimeMs(ms: number): string {
+  return formatTime(ms / 1000);
+}
+
+// New showStatus using the player interface
+async function showStatusWithPlayer(player: SpotifyPlayer) {
+  const state = await player.getPlayerState();
+  const statusText = state.isPlaying ? "playing" : "paused";
+  cecho(`Spotify is currently ${statusText}.`);
+
+  if (state.track) {
+    console.log(`\nArtist: ${state.track.artist}`);
+    console.log(`Album: ${state.track.album}`);
+    console.log(`Track: ${state.track.name}`);
+    console.log(
+      `Position: ${formatTimeMs(state.positionMs)} / ${formatTimeMs(state.track.durationMs)}`,
+    );
+  } else {
+    console.log("\nNo track currently playing.");
+  }
+}
+
+// Legacy showStatus for backward compatibility
 async function showStatus() {
   const state = await runOsascript(
     'tell application "Spotify" to player state as string',
@@ -1086,11 +1642,14 @@ async function main() {
   const command = args[0];
   const rest = args.slice(1);
 
+  // Check for --api flag to force API mode
+  const useApi = args.includes("--api");
+  const filteredRest = rest.filter((arg) => arg !== "--api");
 
   // Handle version flag
   if (command === "--version" || command === "-v") {
-    console.log(`spotify-cli ${VERSION}`)
-    return
+    console.log(`spotify-cli ${VERSION}`);
+    return;
   }
   // Handle login/logout commands separately (doesn't require Spotify app)
   if (command === "login") {
@@ -1104,54 +1663,65 @@ async function main() {
   }
 
   if (command === "top-artists") {
-    await showTopArtists(rest);
+    await showTopArtists(filteredRest);
     return;
   }
 
   if (command === "top-tracks") {
-    await showTopTracks(rest);
+    await showTopTracks(filteredRest);
     return;
   }
 
   if (command === "search") {
-    await searchSpotify(rest);
+    await searchSpotify(filteredRest);
     return;
   }
 
-  // Check if Spotify is installed (required for remaining commands)
-  const spotifyAppPath1 = "/Applications/Spotify.app";
-  const spotifyAppPath2 = join(homedir(), "Applications/Spotify.app");
+  // Create the player instance - use API if --api flag or AppleScript if available
+  const player = await createPlayer(useApi ? "api" : "auto");
+  const isAppleScript = player instanceof AppleScriptPlayer;
 
-  if (!fs.existsSync(spotifyAppPath1) && !fs.existsSync(spotifyAppPath2)) {
-    console.log("The Spotify application must be installed.");
-    process.exit(1);
+  // For AppleScript mode, ensure Spotify app is running
+  if (isAppleScript) {
+    const spotifyAppPath1 = "/Applications/Spotify.app";
+    const spotifyAppPath2 = join(homedir(), "Applications/Spotify.app");
+
+    const spotifyApp1 = Bun.file(spotifyAppPath1);
+    const spotifyApp2 = Bun.file(spotifyAppPath2);
+    if (!spotifyApp1.exists() && !spotifyApp2.exists()) {
+      console.log("The Spotify application must be installed.");
+      process.exit(1);
+    }
+
+    await ensureSpotifyRunning();
   }
-
-  await ensureSpotifyRunning();
 
   switch (command) {
     case "save":
-      await saveCurrentTrack();
+      await saveCurrentTrackWithPlayer(player);
       break;
 
     case "follow":
-      await followCurrentArtist();
+      await followCurrentArtistWithPlayer(player);
       break;
 
     case "play": {
-      if (args.length === 1) {
+      if (args.length === 1 || (args.length === 2 && useApi)) {
         cecho("Playing Spotify.");
-        await runOsascript('tell application "Spotify" to play');
+        await player.play();
       } else {
-        const subcommand = rest[0] || "";
-        const searchQuery = rest
+        const subcommand = filteredRest[0] || "";
+        const searchQuery = filteredRest
           .slice(subcommand === "uri" ? 0 : 1)
           .map((arg) => arg.replace("\\n", "").trim())
           .join(" ")
           .trim();
         let uri = "";
         if (subcommand === "uri") {
-          uri = args.slice(2).join(" ");
+          uri = args
+            .filter((a) => a !== "--api")
+            .slice(2)
+            .join(" ");
           cecho(`Playing Spotify URI: ${uri}`);
         } else if (subcommand === "list") {
           uri = await searchAndPlay("playlist", searchQuery);
@@ -1164,32 +1734,32 @@ async function main() {
             cecho(`Playing (${searchQuery} Search) -> Spotify URI: ${uri}`);
           }
         } else {
-          uri = await searchAndPlay("track", rest.join(" "));
+          uri = await searchAndPlay("track", filteredRest.join(" "));
           if (uri) {
-            cecho(`Playing (${rest.join(" ")} Search) -> Spotify URI: ${uri}`);
+            cecho(
+              `Playing (${filteredRest.join(" ")} Search) -> Spotify URI: ${uri}`,
+            );
           }
         }
 
         if (uri) {
-          await playUri(uri);
+          await player.play(uri);
         }
       }
-      await showStatus();
+      await showStatusWithPlayer(player);
       break;
     }
 
     case "pause":
-      await runOsascript('tell application "Spotify" to playpause');
-      await showStatus();
+      await player.playPause();
+      await showStatusWithPlayer(player);
       break;
 
     case "stop": {
-      const state = await runOsascript(
-        'tell application "Spotify" to player state as string',
-      );
-      if (state === "playing") {
+      const state = await player.getPlayerState();
+      if (state.isPlaying) {
         cecho("Pausing Spotify.");
-        await runOsascript('tell application "Spotify" to playpause');
+        await player.pause();
       } else {
         cecho("Spotify is already stopped.");
       }
@@ -1197,79 +1767,68 @@ async function main() {
     }
 
     case "quit":
+      // Quit only works with local Spotify app (AppleScript)
+      if (!isAppleScript) {
+        cecho(
+          "The quit command is only available when controlling the local Spotify app.",
+        );
+        cecho(
+          "Use --api flag to control playback via API, but quit requires the local app.",
+        );
+        process.exit(1);
+      }
       cecho("Quitting Spotify.");
       await runOsascript('tell application "Spotify" to quit');
       process.exit(0);
 
     case "next":
       cecho("Going to next track.");
-      await runOsascript('tell application "Spotify" to next track');
-      await showStatus();
+      await player.next();
+      await showStatusWithPlayer(player);
       break;
 
     case "prev":
       cecho("Going to previous track.");
-      await runOsascript(`tell application "Spotify"
-        set player position to 0
-        previous track
-      end tell`);
-      await showStatus();
+      await player.previous();
+      await showStatusWithPlayer(player);
       break;
 
     case "replay":
       cecho("Replaying current track.");
-      await runOsascript(
-        'tell application "Spotify" to set player position to 0',
-      );
+      await player.seek(0);
       break;
 
     case "vol": {
-      const volumeCmd = rest[0];
+      const volumeCmd = filteredRest[0];
 
       if (!volumeCmd || volumeCmd === "show") {
-        const vol = await runOsascript(
-          'tell application "Spotify" to sound volume as integer',
-        );
+        const vol = await player.getVolume();
         cecho(`Current Spotify volume level is ${vol}.`);
       } else if (volumeCmd === "up") {
-        const vol = parseInt(
-          await runOsascript(
-            'tell application "Spotify" to sound volume as integer',
-          ),
-        );
+        const vol = await player.getVolume();
         const newVol = vol <= 90 ? vol + 10 : 100;
         cecho(
           vol <= 90
             ? `Increasing Spotify volume to ${newVol}.`
             : "Spotify volume level is at max.",
         );
-        await runOsascript(
-          `tell application "Spotify" to set sound volume to ${newVol}`,
-        );
+        await player.setVolume(newVol);
       } else if (volumeCmd === "down") {
-        const vol = parseInt(
-          await runOsascript(
-            'tell application "Spotify" to sound volume as integer',
-          ),
-        );
+        const vol = await player.getVolume();
         const newVol = vol >= 10 ? vol - 10 : 0;
         cecho(
           vol >= 10
             ? `Reducing Spotify volume to ${newVol}.`
             : "Spotify volume level is at min.",
         );
-        await runOsascript(
-          `tell application "Spotify" to set sound volume to ${newVol}`,
-        );
+        await player.setVolume(newVol);
       } else if (
         /^\d+$/.test(volumeCmd) &&
         parseInt(volumeCmd) >= 0 &&
         parseInt(volumeCmd) <= 100
       ) {
         cecho(`Setting Spotify volume level to ${volumeCmd}`);
-        await runOsascript(
-          `tell application "Spotify" to set sound volume to ${volumeCmd}`,
-        );
+        await player.setVolume(parseInt(volumeCmd));
       } else {
         console.log("Improper use of 'vol' command");
         console.log("The 'vol' command should be used as follows:");
@@ -1291,101 +1850,84 @@ async function main() {
     }
 
     case "toggle":
-      if (rest[0] === "shuffle") {
-        await runOsascript(
-          'tell application "Spotify" to set shuffling to not shuffling',
-        );
-        const curr = await runOsascript(
-          'tell application "Spotify" to shuffling',
-        );
-        cecho(`Spotify shuffling set to ${curr}`);
-      } else if (rest[0] === "repeat") {
-        await runOsascript(
-          'tell application "Spotify" to set repeating to not repeating',
-        );
-        const curr = await runOsascript(
-          'tell application "Spotify" to repeating',
-        );
-        cecho(`Spotify repeating set to ${curr}`);
+      if (filteredRest[0] === "shuffle") {
+        const currentShuffle = await player.getShuffleState();
+        await player.setShuffle(!currentShuffle);
+        cecho(`Spotify shuffling set to ${!currentShuffle}`);
+      } else if (filteredRest[0] === "repeat") {
+        const currentRepeat = await player.getRepeatState();
+        const newRepeat = currentRepeat === "off" ? "context" : "off";
+        await player.setRepeat(newRepeat);
+        cecho(`Spotify repeating set to ${newRepeat !== "off"}`);
       }
       break;
 
     case "status":
-      if (rest.length === 0) {
-        await showStatus();
-      } else if (rest[0] === "artist") {
-        const artist = await showArtist();
-        console.log(artist);
-      } else if (rest[0] === "album") {
-        const album = await showAlbum();
-        console.log(album);
-      } else if (rest[0] === "track") {
-        const track = await showTrack();
-        console.log(track);
+      if (filteredRest.length === 0) {
+        await showStatusWithPlayer(player);
+      } else if (filteredRest[0] === "artist") {
+        const track = await player.getCurrentTrack();
+        console.log(track?.artist ?? "");
+      } else if (filteredRest[0] === "album") {
+        const track = await player.getCurrentTrack();
+        console.log(track?.album ?? "");
+      } else if (filteredRest[0] === "track") {
+        const track = await player.getCurrentTrack();
+        console.log(track?.name ?? "");
       }
       break;
 
     case "info": {
-      const info = await runOsascript(`tell application "Spotify"
-        set durSec to (duration of current track / 1000)
-        set tM to (round (durSec / 60) rounding down) as text
-        if length of ((durSec mod 60 div 1) as text) is greater than 1 then
-          set tS to (durSec mod 60 div 1) as text
-        else
-          set tS to ("0" & (durSec mod 60 div 1)) as text
-        end if
-        set myTime to tM as text & "min " & tS as text & "s"
-        set pos to player position
-        set nM to (round (pos / 60) rounding down) as text
-        if length of ((round (pos mod 60) rounding down) as text) is greater than 1 then
-          set nS to (round (pos mod 60) rounding down) as text
-        else
-          set nS to ("0" & (round (pos mod 60) rounding down)) as text
-        end if
-        set nowAt to nM as text & "min " & nS as text & "s"
-        set info to "" & "\\nArtist:         " & artist of current track
-        set info to info & "\\nTrack:          " & name of current track
-        set info to info & "\\nAlbum:          " & album of current track
-        set info to info & "\\nDuration:       " & mytime
-        set info to info & "\\nNow at:         " & nowAt
-        set info to info & "\\nVolume:         " & sound volume
-      end tell
-      return info`);
-      cecho(info);
+      const state = await player.getPlayerState();
+      if (state.track) {
+        const durationSec = state.track.durationMs / 1000;
+        const positionSec = state.positionMs / 1000;
+        console.log(`\nArtist:         ${state.track.artist}`);
+        console.log(`Track:          ${state.track.name}`);
+        console.log(`Album:          ${state.track.album}`);
+        console.log(`Duration:       ${formatTime(durationSec)}`);
+        console.log(`Now at:         ${formatTime(positionSec)}`);
+        console.log(`Volume:         ${state.volume}`);
+      } else {
+        cecho("No track currently playing.");
+      }
       break;
     }
 
     case "share": {
-      const uri = await runOsascript(
-        'tell application "Spotify" to spotify url of current track',
-      );
+      const track = await player.getCurrentTrack();
+      if (!track) {
+        cecho("No track currently playing.");
+        break;
+      }
+      const uri = track.uri;
       const url = uri.replace(
         "spotify:track:",
         "https://open.spotify.com/track/",
       );
 
-      if (!rest[0]) {
+      if (!filteredRest[0]) {
         cecho(`Spotify URL: ${url}`);
         cecho(`Spotify URI: ${uri}`);
         console.log("To copy the URL or URI to your clipboard, use:");
         console.log("`spotify share url` or");
         console.log("`spotify share uri` respectively.");
-      } else if (rest[0] === "url") {
+      } else if (filteredRest[0] === "url") {
         cecho(`Spotify URL: ${url}`);
         await bun.$`echo -n ${url} | pbcopy`;
-      } else if (rest[0] === "uri") {
+      } else if (filteredRest[0] === "uri") {
         cecho(`Spotify URI: ${uri}`);
         await bun.$`echo -n ${uri} | pbcopy`;
       }
       break;
     }
 
-    case "pos":
+    case "pos": {
+      const positionSec = parseFloat(filteredRest[0] || "0");
       cecho("Adjusting Spotify play position.");
-      await runOsascript(
-        `tell application "Spotify" to set player position to ${rest[0]}`,
-      );
+      await player.seek(positionSec * 1000);
       break;
+    }
 
     case "help":
       showHelp();
@@ -1398,5 +1940,5 @@ async function main() {
 }
 
 // Initialize and run
-initializeConfig();
+await initializeConfig();
 await main();

@@ -10,6 +10,7 @@
 ## Code Style Guidelines
 
 - **Language**: TypeScript with strict mode enabled
+- **Libraries**: Use Bun build-in libraries first, then node build in libraries. DO NOT install packages from NPM.
 - **Imports**: Group Node.js built-ins first, then external libraries
 - **Naming**: camelCase for functions/variables, UPPER_SNAKE_CASE for constants
 - **Types**: Use interfaces for object types, explicit return types
@@ -22,4 +23,3 @@
 
 - When you need to search docs, use `context7` tools.
 - If you are unsure how to do something, use `gh_grep` to search code examples from github.
-
