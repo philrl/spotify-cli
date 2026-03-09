@@ -7,13 +7,88 @@ import bun from "bun";
 // Version - injected at build time via --define, defaults to "dev" for local development
 declare const CLI_VERSION: string;
 const VERSION = typeof CLI_VERSION !== "undefined" ? CLI_VERSION : "dev";
+//////////////////////////////////////////////////////////////////////////////
+// Configuration
+//////////////////////////////////////////////////////////////////////////////
+const USER_CONFIG_FILE = join(homedir(), ".shpotify.cfg");
+const USER_CONFIG_DEFAULTS = 'CLIENT_ID=""\nCLIENT_SECRET=""';
+const SPOTIFY_CLI_SERVICE = "spotify-cli";
+const SPOTIFY_AUTH_URI = "https://accounts.spotify.com/authorize";
+const SPOTIFY_TOKEN_URI = "https://accounts.spotify.com/api/token";
+const SPOTIFY_SEARCH_API = "https://api.spotify.com/v1/search";
+const OAUTH_REDIRECT_PORT = 8888;
+const OAUTH_REDIRECT_URI = `http://127.0.0.1:${OAUTH_REDIRECT_PORT}/callback`;
+const SPOTIFY_API_BASE = "https://api.spotify.com/v1";
+const OAUTH_SCOPES = [
+  "user-read-private",
+  "user-read-email",
+  "user-read-playback-state",
+  "user-modify-playback-state",
+  "user-read-currently-playing",
+  "user-library-modify",
+  "user-library-read",
+  "user-follow-modify",
+  "user-follow-read",
+  "user-top-read",
+].join(" ");
 
-// Types
 interface Config {
   CLIENT_ID: string;
   CLIENT_SECRET: string;
 }
+let config: Config = { CLIENT_ID: "", CLIENT_SECRET: "" };
+let spotifyAccessToken: string = "";
 
+// Initialize config file
+async function initializeConfig() {
+  const configFile = Bun.file(USER_CONFIG_FILE);
+  if (!configFile.exists()) {
+    await configFile.write(USER_CONFIG_DEFAULTS);
+  }
+  await loadConfig();
+}
+
+async function loadConfig() {
+  try {
+    const configFile = Bun.file(USER_CONFIG_FILE);
+    const content = await configFile.text();
+    const lines = content.split("\n");
+    for (const line of lines) {
+      if (line.startsWith("CLIENT_ID=")) {
+        config.CLIENT_ID = line.replace('CLIENT_ID="', "").replace('"', "");
+      }
+      if (line.startsWith("CLIENT_SECRET=")) {
+        config.CLIENT_SECRET = line
+          .replace('CLIENT_SECRET="', "")
+          .replace('"', "");
+      }
+    }
+  } catch (error) {
+    cecho(`Error loading config: ${error}`);
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Spotify Token Management
+//////////////////////////////////////////////////////////////////////////////
+// PKCE Helper Functions
+function generateCodeVerifier(length: number = 64): string {
+  const possible =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const values = crypto.getRandomValues(new Uint8Array(length));
+  return values.reduce((acc, x) => acc + possible[x % possible.length], "");
+}
+
+async function generateCodeChallenge(codeVerifier: string): Promise<string> {
+  const data = new TextEncoder().encode(codeVerifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+// Token Storage Functions
 interface SpotifyTokenResponse {
   access_token: string;
   refresh_token?: string;
@@ -28,6 +103,338 @@ interface StoredTokens {
   refresh_token: string;
   expires_at: number;
 }
+
+async function saveTokens(tokens: StoredTokens): Promise<void> {
+  const tokenData = JSON.stringify(tokens);
+  await Bun.secrets.set({
+    service: SPOTIFY_CLI_SERVICE,
+    name: "tokens",
+    value: tokenData,
+    allowUnrestrictedAccess: false,
+  });
+}
+
+async function loadTokens(): Promise<StoredTokens | null> {
+  try {
+    const tokenData = await Bun.secrets.get({
+      service: SPOTIFY_CLI_SERVICE,
+      name: "tokens",
+    });
+
+    if (tokenData) {
+      return JSON.parse(tokenData) as StoredTokens;
+    }
+  } catch (error) {
+    // Token doesn't exist or is invalid
+  }
+  return null;
+}
+
+function isTokenExpired(tokens: StoredTokens): boolean {
+  return Date.now() >= tokens.expires_at - 60000; // 1 minute buffer
+}
+
+async function refreshAccessToken(
+  refreshToken: string,
+): Promise<StoredTokens | null> {
+  if (!config.CLIENT_ID) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(SPOTIFY_TOKEN_URI, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: config.CLIENT_ID,
+      }),
+    });
+
+    const data = (await response.json()) as SpotifyTokenResponse;
+
+    if (!data.access_token) {
+      return null;
+    }
+
+    const tokens: StoredTokens = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token || refreshToken,
+      expires_at: Date.now() + (data.expires_in || 3600) * 1000,
+    };
+
+    await saveTokens(tokens);
+    return tokens;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function getValidAccessToken(): Promise<string | null> {
+  const tokens = await loadTokens();
+  if (!tokens) {
+    return null;
+  }
+
+  if (isTokenExpired(tokens)) {
+    const refreshed = await refreshAccessToken(tokens.refresh_token);
+    if (refreshed) {
+      return refreshed.access_token;
+    }
+    return null;
+  }
+
+  return tokens.access_token;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Login Flow
+////////////////////////////////////////////////////////////////////////////////
+async function login(): Promise<void> {
+  if (!config.CLIENT_ID) {
+    cecho(`Invalid Client ID, please update ${USER_CONFIG_FILE}`);
+    showAPIHelp();
+    return;
+  }
+
+  const codeVerifier = generateCodeVerifier(64);
+  const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+  const authParams = new URLSearchParams({
+    client_id: config.CLIENT_ID,
+    response_type: "code",
+    redirect_uri: OAUTH_REDIRECT_URI,
+    scope: OAUTH_SCOPES,
+    code_challenge_method: "S256",
+    code_challenge: codeChallenge,
+  });
+
+  const authUrl = `${SPOTIFY_AUTH_URI}?${authParams.toString()}`;
+
+  cecho("Opening browser for Spotify login...");
+  cecho("Please authorize the application in your browser.");
+
+  // Open the browser
+  await bun.$`open ${authUrl}`;
+
+  // Start a local server to receive the callback
+  let resolveAuth: (code: string) => void;
+  let rejectAuth: (error: Error) => void;
+  const authPromise = new Promise<string>((resolve, reject) => {
+    resolveAuth = resolve;
+    rejectAuth = reject;
+  });
+
+  const server = Bun.serve({
+    port: OAUTH_REDIRECT_PORT,
+    fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === "/callback") {
+        const code = url.searchParams.get("code");
+        const error = url.searchParams.get("error");
+
+        if (error) {
+          // Delay reject to allow response to be sent
+          setTimeout(
+            () => rejectAuth(new Error(`Authorization failed: ${error}`)),
+            100,
+          );
+          return new Response(
+            "<html><body><h1>Authorization Failed</h1><p>You can close this window.</p></body></html>",
+            { headers: { "Content-Type": "text/html" } },
+          );
+        }
+
+        if (code) {
+          // Delay resolve to allow response to be sent
+          setTimeout(() => resolveAuth(code), 100);
+          return new Response(
+            "<html><body><h1>Login Successful!</h1><p>You can close this window and return to the terminal.</p></body></html>",
+            { headers: { "Content-Type": "text/html" } },
+          );
+        }
+      }
+      return new Response("Not Found", { status: 404 });
+    },
+  });
+
+  // Timeout after 2 minutes
+  const timeoutId = setTimeout(() => {
+    rejectAuth(new Error("Login timeout - please try again"));
+  }, 120000);
+
+  let authCode: string;
+  try {
+    authCode = await authPromise;
+  } finally {
+    // Clean up: clear timeout and stop server
+    clearTimeout(timeoutId);
+    await server.stop(true);
+  }
+
+  cecho("Exchanging authorization code for tokens...");
+
+  // Exchange the authorization code for tokens
+  const tokenResponse = await fetch(SPOTIFY_TOKEN_URI, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code: authCode,
+      redirect_uri: OAUTH_REDIRECT_URI,
+      client_id: config.CLIENT_ID,
+      code_verifier: codeVerifier,
+    }),
+  });
+
+  const tokenData = (await tokenResponse.json()) as SpotifyTokenResponse;
+
+  if (!tokenData.access_token) {
+    cecho("Failed to obtain access token");
+    console.log(JSON.stringify(tokenData, null, 2));
+    return;
+  }
+
+  const tokens: StoredTokens = {
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token || "",
+    expires_at: Date.now() + (tokenData.expires_in || 3600) * 1000,
+  };
+
+  await saveTokens(tokens);
+  cecho("Login successful! You are now authenticated with Spotify.");
+}
+
+// Logout function
+async function logout(): Promise<void> {
+  try {
+    const deleted = await Bun.secrets.delete({
+      service: SPOTIFY_CLI_SERVICE,
+      name: "tokens",
+    });
+
+    if (deleted) {
+      cecho(
+        "Successfully logged out. Tokens have been removed from secure storage.",
+      );
+    } else {
+      cecho("No stored tokens found. You were already logged out.");
+    }
+  } catch (error) {
+    cecho("Error during logout: " + error);
+  }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Centralized Spotify API request function with auto re-auth
+//////////////////////////////////////////////////////////////////////////////
+interface ApiRequestOptions {
+  method?: "GET" | "POST" | "PUT" | "DELETE";
+  body?: object;
+  params?: Record<string, string>;
+}
+
+interface ApiResponse<T> {
+  ok: boolean;
+  status: number;
+  data?: T;
+  error?: string;
+}
+
+async function spotifyApiRequest<T>(
+  path: string,
+  options: ApiRequestOptions = {},
+  isRetry = false,
+): Promise<ApiResponse<T>> {
+  const { method = "GET", body, params } = options;
+
+  // Get access token, trigger login if not available
+  let accessToken = await getValidAccessToken();
+
+  if (!accessToken) {
+    if (isRetry) {
+      return {
+        ok: false,
+        status: 401,
+        error: "Failed to authenticate after retry",
+      };
+    }
+    cecho("Not logged in. Starting login flow...");
+    await login();
+    accessToken = await getValidAccessToken();
+
+    if (!accessToken) {
+      return { ok: false, status: 401, error: "Failed to authenticate" };
+    }
+  }
+
+  // Build URL with query params
+  let url = `${SPOTIFY_API_BASE}${path}`;
+  if (params) {
+    const searchParams = new URLSearchParams(params);
+    url += `?${searchParams.toString()}`;
+  }
+
+  // Make the request
+  const fetchOptions: RequestInit = {
+    method,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  };
+
+  if (body && method !== "GET") {
+    fetchOptions.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(url, fetchOptions);
+
+  // Handle auth errors - logout, re-login, and retry once
+  if ((response.status === 401 || response.status === 403) && !isRetry) {
+    cecho("Authentication error. Re-authenticating...");
+    await logout();
+    return spotifyApiRequest<T>(path, options, true);
+  }
+
+  // Parse response
+  if (!response.ok) {
+    const errorText = await response.text();
+    return { ok: false, status: response.status, error: errorText };
+  }
+
+  // Handle empty responses (204 No Content, or empty body)
+  if (response.status === 204) {
+    return { ok: true, status: 204 };
+  }
+
+  // Check content-length or try to parse JSON safely
+  const contentLength = response.headers.get("content-length");
+  if (contentLength === "0") {
+    return { ok: true, status: response.status };
+  }
+
+  // Try to parse JSON, handle empty responses gracefully
+  const text = await response.text();
+  if (!text || text.trim() === "") {
+    return { ok: true, status: response.status };
+  }
+
+  try {
+    const data = JSON.parse(text) as T;
+    return { ok: true, status: response.status, data };
+  } catch {
+    // If JSON parsing fails but response was ok, return success without data
+    return { ok: true, status: response.status };
+  }
+}
+
+// Types
 
 interface SpotifySearchResponse {
   playlists?: {
@@ -54,6 +461,10 @@ interface SpotifySearchResponse {
     }>;
   };
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Spotify Player Implementations
+////////////////////////////////////////////////////////////////////////////////
 
 // Player abstraction types
 type RepeatMode = "off" | "track" | "context";
@@ -495,405 +906,6 @@ async function createPlayer(
   return new ApiPlayer();
 }
 
-// Configuration
-const USER_CONFIG_FILE = join(homedir(), ".shpotify.cfg");
-const USER_CONFIG_DEFAULTS = 'CLIENT_ID=""\nCLIENT_SECRET=""';
-const SPOTIFY_CLI_SERVICE = "spotify-cli";
-const SPOTIFY_AUTH_URI = "https://accounts.spotify.com/authorize";
-const SPOTIFY_TOKEN_URI = "https://accounts.spotify.com/api/token";
-const SPOTIFY_SEARCH_API = "https://api.spotify.com/v1/search";
-const OAUTH_REDIRECT_PORT = 8888;
-const OAUTH_REDIRECT_URI = `http://localhost:${OAUTH_REDIRECT_PORT}/callback`;
-const SPOTIFY_API_BASE = "https://api.spotify.com/v1";
-const OAUTH_SCOPES = [
-  "user-read-private",
-  "user-read-email",
-  "user-read-playback-state",
-  "user-modify-playback-state",
-  "user-read-currently-playing",
-  "user-library-modify",
-  "user-library-read",
-  "user-follow-modify",
-  "user-follow-read",
-  "user-top-read",
-].join(" ");
-
-let config: Config = { CLIENT_ID: "", CLIENT_SECRET: "" };
-let spotifyAccessToken: string = "";
-
-// Initialize config file
-async function initializeConfig() {
-  const configFile = Bun.file(USER_CONFIG_FILE);
-  if (!configFile.exists()) {
-    await configFile.write(USER_CONFIG_DEFAULTS);
-  }
-  await loadConfig();
-}
-
-async function loadConfig() {
-  try {
-    const configFile = Bun.file(USER_CONFIG_FILE);
-    const content = await configFile.text();
-    const lines = content.split("\n");
-    for (const line of lines) {
-      if (line.startsWith("CLIENT_ID=")) {
-        config.CLIENT_ID = line.replace('CLIENT_ID="', "").replace('"', "");
-      }
-      if (line.startsWith("CLIENT_SECRET=")) {
-        config.CLIENT_SECRET = line
-          .replace('CLIENT_SECRET="', "")
-          .replace('"', "");
-      }
-    }
-  } catch (error) {
-    cecho(`Error loading config: ${error}`);
-  }
-}
-
-// PKCE Helper Functions
-function generateCodeVerifier(length: number = 64): string {
-  const possible =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const values = crypto.getRandomValues(new Uint8Array(length));
-  return values.reduce((acc, x) => acc + possible[x % possible.length], "");
-}
-
-async function generateCodeChallenge(codeVerifier: string): Promise<string> {
-  const data = new TextEncoder().encode(codeVerifier);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return btoa(String.fromCharCode(...new Uint8Array(digest)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-// Token Storage Functions
-async function saveTokens(tokens: StoredTokens): Promise<void> {
-  const tokenData = JSON.stringify(tokens);
-  await Bun.secrets.set({
-    service: SPOTIFY_CLI_SERVICE,
-    name: "tokens",
-    value: tokenData,
-    allowUnrestrictedAccess: false,
-  });
-}
-
-async function loadTokens(): Promise<StoredTokens | null> {
-  try {
-    const tokenData = await Bun.secrets.get({
-      service: SPOTIFY_CLI_SERVICE,
-      name: "tokens",
-    });
-
-    if (tokenData) {
-      return JSON.parse(tokenData) as StoredTokens;
-    }
-  } catch (error) {
-    // Token doesn't exist or is invalid
-  }
-  return null;
-}
-
-function isTokenExpired(tokens: StoredTokens): boolean {
-  return Date.now() >= tokens.expires_at - 60000; // 1 minute buffer
-}
-
-async function refreshAccessToken(
-  refreshToken: string,
-): Promise<StoredTokens | null> {
-  if (!config.CLIENT_ID) {
-    return null;
-  }
-
-  try {
-    const response = await fetch(SPOTIFY_TOKEN_URI, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: refreshToken,
-        client_id: config.CLIENT_ID,
-      }),
-    });
-
-    const data = (await response.json()) as SpotifyTokenResponse;
-
-    if (!data.access_token) {
-      return null;
-    }
-
-    const tokens: StoredTokens = {
-      access_token: data.access_token,
-      refresh_token: data.refresh_token || refreshToken,
-      expires_at: Date.now() + (data.expires_in || 3600) * 1000,
-    };
-
-    await saveTokens(tokens);
-    return tokens;
-  } catch (error) {
-    return null;
-  }
-}
-
-async function getValidAccessToken(): Promise<string | null> {
-  const tokens = await loadTokens();
-  if (!tokens) {
-    return null;
-  }
-
-  if (isTokenExpired(tokens)) {
-    const refreshed = await refreshAccessToken(tokens.refresh_token);
-    if (refreshed) {
-      return refreshed.access_token;
-    }
-    return null;
-  }
-
-  return tokens.access_token;
-}
-
-// Centralized Spotify API request function with auto re-auth
-interface ApiRequestOptions {
-  method?: "GET" | "POST" | "PUT" | "DELETE";
-  body?: object;
-  params?: Record<string, string>;
-}
-
-interface ApiResponse<T> {
-  ok: boolean;
-  status: number;
-  data?: T;
-  error?: string;
-}
-
-async function spotifyApiRequest<T>(
-  path: string,
-  options: ApiRequestOptions = {},
-  isRetry = false,
-): Promise<ApiResponse<T>> {
-  const { method = "GET", body, params } = options;
-
-  // Get access token, trigger login if not available
-  let accessToken = await getValidAccessToken();
-
-  if (!accessToken) {
-    if (isRetry) {
-      return {
-        ok: false,
-        status: 401,
-        error: "Failed to authenticate after retry",
-      };
-    }
-    cecho("Not logged in. Starting login flow...");
-    await login();
-    accessToken = await getValidAccessToken();
-
-    if (!accessToken) {
-      return { ok: false, status: 401, error: "Failed to authenticate" };
-    }
-  }
-
-  // Build URL with query params
-  let url = `${SPOTIFY_API_BASE}${path}`;
-  if (params) {
-    const searchParams = new URLSearchParams(params);
-    url += `?${searchParams.toString()}`;
-  }
-
-  // Make the request
-  const fetchOptions: RequestInit = {
-    method,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-  };
-
-  if (body && method !== "GET") {
-    fetchOptions.body = JSON.stringify(body);
-  }
-
-  const response = await fetch(url, fetchOptions);
-
-  // Handle auth errors - logout, re-login, and retry once
-  if ((response.status === 401 || response.status === 403) && !isRetry) {
-    cecho("Authentication error. Re-authenticating...");
-    await logout();
-    return spotifyApiRequest<T>(path, options, true);
-  }
-
-  // Parse response
-  if (!response.ok) {
-    const errorText = await response.text();
-    return { ok: false, status: response.status, error: errorText };
-  }
-
-  // Handle empty responses (204 No Content, or empty body)
-  if (response.status === 204) {
-    return { ok: true, status: 204 };
-  }
-
-  // Check content-length or try to parse JSON safely
-  const contentLength = response.headers.get("content-length");
-  if (contentLength === "0") {
-    return { ok: true, status: response.status };
-  }
-
-  // Try to parse JSON, handle empty responses gracefully
-  const text = await response.text();
-  if (!text || text.trim() === "") {
-    return { ok: true, status: response.status };
-  }
-
-  try {
-    const data = JSON.parse(text) as T;
-    return { ok: true, status: response.status, data };
-  } catch {
-    // If JSON parsing fails but response was ok, return success without data
-    return { ok: true, status: response.status };
-  }
-}
-
-// Login Flow
-async function login(): Promise<void> {
-  if (!config.CLIENT_ID) {
-    cecho(`Invalid Client ID, please update ${USER_CONFIG_FILE}`);
-    showAPIHelp();
-    return;
-  }
-
-  const codeVerifier = generateCodeVerifier(64);
-  const codeChallenge = await generateCodeChallenge(codeVerifier);
-
-  const authParams = new URLSearchParams({
-    client_id: config.CLIENT_ID,
-    response_type: "code",
-    redirect_uri: OAUTH_REDIRECT_URI,
-    scope: OAUTH_SCOPES,
-    code_challenge_method: "S256",
-    code_challenge: codeChallenge,
-  });
-
-  const authUrl = `${SPOTIFY_AUTH_URI}?${authParams.toString()}`;
-
-  cecho("Opening browser for Spotify login...");
-  cecho("Please authorize the application in your browser.");
-
-  // Open the browser
-  await bun.$`open ${authUrl}`;
-
-  // Start a local server to receive the callback
-  let resolveAuth: (code: string) => void;
-  let rejectAuth: (error: Error) => void;
-  const authPromise = new Promise<string>((resolve, reject) => {
-    resolveAuth = resolve;
-    rejectAuth = reject;
-  });
-
-  const server = Bun.serve({
-    port: OAUTH_REDIRECT_PORT,
-    fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname === "/callback") {
-        const code = url.searchParams.get("code");
-        const error = url.searchParams.get("error");
-
-        if (error) {
-          // Delay reject to allow response to be sent
-          setTimeout(
-            () => rejectAuth(new Error(`Authorization failed: ${error}`)),
-            100,
-          );
-          return new Response(
-            "<html><body><h1>Authorization Failed</h1><p>You can close this window.</p></body></html>",
-            { headers: { "Content-Type": "text/html" } },
-          );
-        }
-
-        if (code) {
-          // Delay resolve to allow response to be sent
-          setTimeout(() => resolveAuth(code), 100);
-          return new Response(
-            "<html><body><h1>Login Successful!</h1><p>You can close this window and return to the terminal.</p></body></html>",
-            { headers: { "Content-Type": "text/html" } },
-          );
-        }
-      }
-      return new Response("Not Found", { status: 404 });
-    },
-  });
-
-  // Timeout after 2 minutes
-  const timeoutId = setTimeout(() => {
-    rejectAuth(new Error("Login timeout - please try again"));
-  }, 120000);
-
-  let authCode: string;
-  try {
-    authCode = await authPromise;
-  } finally {
-    // Clean up: clear timeout and stop server
-    clearTimeout(timeoutId);
-    await server.stop(true);
-  }
-
-  cecho("Exchanging authorization code for tokens...");
-
-  // Exchange the authorization code for tokens
-  const tokenResponse = await fetch(SPOTIFY_TOKEN_URI, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code: authCode,
-      redirect_uri: OAUTH_REDIRECT_URI,
-      client_id: config.CLIENT_ID,
-      code_verifier: codeVerifier,
-    }),
-  });
-
-  const tokenData = (await tokenResponse.json()) as SpotifyTokenResponse;
-
-  if (!tokenData.access_token) {
-    cecho("Failed to obtain access token");
-    console.log(JSON.stringify(tokenData, null, 2));
-    return;
-  }
-
-  const tokens: StoredTokens = {
-    access_token: tokenData.access_token,
-    refresh_token: tokenData.refresh_token || "",
-    expires_at: Date.now() + (tokenData.expires_in || 3600) * 1000,
-  };
-
-  await saveTokens(tokens);
-  cecho("Login successful! You are now authenticated with Spotify.");
-}
-
-// Logout function
-async function logout(): Promise<void> {
-  try {
-    const deleted = await Bun.secrets.delete({
-      service: SPOTIFY_CLI_SERVICE,
-      name: "tokens",
-    });
-
-    if (deleted) {
-      cecho(
-        "Successfully logged out. Tokens have been removed from secure storage.",
-      );
-    } else {
-      cecho("No stored tokens found. You were already logged out.");
-    }
-  } catch (error) {
-    cecho("Error during logout: " + error);
-  }
-}
-
 // Get current track ID using player interface
 async function getCurrentTrackIdWithPlayer(
   player: SpotifyPlayer,
@@ -927,40 +939,14 @@ async function saveCurrentTrackWithPlayer(
     cecho("No track is currently playing.");
     return;
   }
-
-  // Save the track
-  const response = await spotifyApiRequest("/me/tracks", {
+  // Save the track using new unified library endpoint
+  const response = await spotifyApiRequest("/me/library", {
     method: "PUT",
-    body: { ids: [track.id] },
+    params: { uris: track.uri },
   });
 
   if (response.ok) {
     cecho(`Saved "${track.name}" by ${track.artist} to your library.`);
-  } else {
-    cecho(`Failed to save track: ${response.status} ${response.error}`);
-  }
-}
-
-// Legacy function for backward compatibility
-async function saveCurrentTrack(): Promise<void> {
-  // Get current track info for display
-  const artist = await showArtist();
-  const track = await showTrack();
-  const trackId = await getCurrentTrackId();
-
-  if (!trackId) {
-    cecho("No track is currently playing.");
-    return;
-  }
-
-  // Save the track
-  const response = await spotifyApiRequest("/me/tracks", {
-    method: "PUT",
-    body: { ids: [trackId] },
-  });
-
-  if (response.ok) {
-    cecho(`Saved "${track}" by ${artist} to your library.`);
   } else {
     cecho(`Failed to save track: ${response.status} ${response.error}`);
   }
@@ -1004,49 +990,10 @@ async function followCurrentArtistWithPlayer(
     return;
   }
 
-  // Follow the artist
-  const response = await spotifyApiRequest("/me/following", {
+  // Follow the artist using new unified library endpoint
+  const response = await spotifyApiRequest("/me/library", {
     method: "PUT",
-    params: { type: "artist", ids: artist.id },
-  });
-
-  if (response.ok) {
-    cecho(`Now following ${artist.name}.`);
-  } else {
-    cecho(`Failed to follow artist: ${response.status} ${response.error}`);
-  }
-}
-
-// Legacy function for backward compatibility
-async function followCurrentArtist(): Promise<void> {
-  // Get current track ID
-  const trackId = await getCurrentTrackId();
-
-  if (!trackId) {
-    cecho("No track is currently playing.");
-    return;
-  }
-
-  // Get track details to get artist ID
-  const trackDetails = await getTrackDetails(trackId);
-
-  if (!trackDetails || trackDetails.artists.length === 0) {
-    cecho("Could not get artist information for the current track.");
-    return;
-  }
-
-  // Get the first (primary) artist
-  const artist = trackDetails.artists[0];
-
-  if (!artist) {
-    cecho("Could not get artist information for the current track.");
-    return;
-  }
-
-  // Follow the artist
-  const response = await spotifyApiRequest("/me/following", {
-    method: "PUT",
-    params: { type: "artist", ids: artist.id },
+    params: { uris: `spotify:artist:${artist.id}` },
   });
 
   if (response.ok) {
@@ -1060,14 +1007,12 @@ async function followCurrentArtist(): Promise<void> {
 interface TopArtist {
   name: string;
   genres: string[];
-  popularity: number;
 }
 
 interface TopTrack {
   name: string;
   artists: Array<{ name: string }>;
   album: { name: string };
-  popularity: number;
 }
 
 interface TopItemsResponse<T> {
