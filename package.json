@@ -2,7 +2,7 @@
   "name": "spotify-cli",
   "private": true,
   "scripts": {
-    "build": "bun build spotify.ts --compile --outfile dist/spotify-cli"
+    "build": "bun build spotify.ts --compile --target=bun-darwin-arm64 --outfile dist/spotify-cli"
   },
   "devDependencies": {
     "@types/bun": "latest"

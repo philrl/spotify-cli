@@ -30,6 +30,7 @@ jobs:
       - name: Build binary
         run: |
           bun build spotify.ts --compile --outfile dist/spotify-cli \
+            --target=bun-darwin-arm64 \
             --define "CLI_VERSION='${{ steps.version.outputs.VERSION }}'"
 
       - name: Generate checksum
