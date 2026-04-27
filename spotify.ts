@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { homedir } from "os";
 import { join } from "path";
-// import * as fs from "fs";
+import * as fs from "fs";
 import bun from "bun";
 
 // Version - injected at build time via --define, defaults to "dev" for local development
@@ -894,8 +894,8 @@ async function createPlayer(
     const spotifyAppPath1 = "/Applications/Spotify.app";
     const spotifyAppPath2 = join(homedir(), "Applications/Spotify.app");
 
-    const app1Exists = await Bun.file(spotifyAppPath1).exists();
-    const app2Exists = await Bun.file(spotifyAppPath2).exists();
+    const app1Exists = fs.existsSync(spotifyAppPath1);
+    const app2Exists = fs.existsSync(spotifyAppPath2)
 
     if (app1Exists || app2Exists) {
       return new AppleScriptPlayer();
@@ -1631,9 +1631,9 @@ async function main() {
     const spotifyAppPath1 = "/Applications/Spotify.app";
     const spotifyAppPath2 = join(homedir(), "Applications/Spotify.app");
 
-    const spotifyApp1 = Bun.file(spotifyAppPath1);
-    const spotifyApp2 = Bun.file(spotifyAppPath2);
-    if (!spotifyApp1.exists() && !spotifyApp2.exists()) {
+    const spotifyApp1Exists = fs.existsSync(spotifyAppPath1);
+    const spotifyApp2Exists = fs.existsSync(spotifyAppPath2);
+    if (!spotifyApp1Exists && !spotifyApp2Exists) {
       console.log("The Spotify application must be installed.");
       process.exit(1);
     }
